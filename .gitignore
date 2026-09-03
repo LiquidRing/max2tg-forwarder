@@ -1,0 +1,23 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Локальное состояние моста
+.env
+tokens.json
+*.sqlite3*
+
+*.session*
+
+# Журналы и локальные снимки состояния
+bot.log*
+*.backup
+max_login_qr.png
+.serena/

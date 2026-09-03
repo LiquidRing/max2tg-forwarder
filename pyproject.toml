@@ -1,0 +1,61 @@
+[project]
+name = "max2tg-forwarder"
+version = "0.1.0"
+description = "Двусторонний мост между чатами MAX Messenger и группами Telegram"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.31.0",
+    "aiohttp-socks>=0.10",
+    "aiosqlite>=0.21.0",
+    "cryptography>=50.0.1",
+    "pydantic-settings>=2.15.0",
+    "pyromax>=0.8",
+    "sqlalchemy>=2.0.52",
+    "telethon>=1.44.0",
+    "tenacity>=9.1.4",
+]
+
+[project.scripts]
+max2tg = "max2tg.__main__:run"
+
+[build-system]
+requires = ["uv_build>=0.11.31,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "max2tg"
+module-root = "src"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.14.0",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.9.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "RUF"]
+# RUF001-003 ругаются на кириллицу в строках и комментариях — проект русскоязычный.
+ignore = ["B008", "RUF001", "RUF002", "RUF003"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+mypy_path = "src"
+packages = ["max2tg"]
+ignore_missing_imports = true
+disallow_subclassing_any = false
+disallow_any_generics = false
+warn_return_any = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]

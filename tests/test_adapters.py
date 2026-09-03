@@ -1156,17 +1156,31 @@ def test_permanent_max_errors_are_not_retried() -> None:
     assert not _is_permanent(TimeoutError())
 
 
-def test_voice_and_round_degrade_to_supported_kinds() -> None:
-    """Голос и кружок MAX принимает только файлом и обычным видео."""
-    from pyromax.models import FileAttachment, VideoAttachment
+def test_round_video_keeps_its_shape_in_max() -> None:
+    """Кружок уходит своей ячейкой и с длительностью — иначе он не круглый."""
+    from pyromax.models import FileAttachment, VideoNoteAttachment
 
-    from max2tg.adapters.max_adapter import DEGRADED_NOTES, UPLOAD_TYPES
+    from max2tg.adapters.max_adapter import (
+        DEFAULT_ROUND_DURATION_MS,
+        DEGRADED_NOTES,
+        UPLOAD_TYPES,
+        _as_round,
+    )
 
+    assert UPLOAD_TYPES[AttachmentKind.VIDEO_NOTE] is VideoNoteAttachment
+    # Голосовое MAX от сторонних клиентов не принимает — едет файлом с пометкой.
     assert UPLOAD_TYPES[AttachmentKind.VOICE] is FileAttachment
-    assert UPLOAD_TYPES[AttachmentKind.VIDEO_NOTE] is VideoAttachment
-    # Получателю нужно понимать, чем это было в Telegram.
     assert AttachmentKind.VOICE in DEGRADED_NOTES
-    assert AttachmentKind.VIDEO_NOTE in DEGRADED_NOTES
+    assert AttachmentKind.VIDEO_NOTE not in DEGRADED_NOTES
+
+    class _Uploaded:
+        video_id = 42
+        token = "t"
+
+    payload = _as_round(_Uploaded(), 7).to_payload[0]
+    assert payload == {"_type": "VIDEO", "videoId": 42, "token": "t", "duration": 7000}
+    # Без длительности сервер отвергает вложение, поэтому она всегда есть.
+    assert _as_round(_Uploaded(), None).to_payload[0]["duration"] == DEFAULT_ROUND_DURATION_MS
 
 
 def test_link_request_needs_message_address() -> None:

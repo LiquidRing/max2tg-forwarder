@@ -33,6 +33,7 @@ from pyromax.models.Attachments import (
     FileAttachment,
     PhotoAttachment,
     VideoAttachment,
+    VideoNoteAttachment,
 )
 
 from ..config import Settings
@@ -118,16 +119,19 @@ SEND_ATTEMPTS = 5
 
 #: Вид вложения Telegram -> класс вложения MAX для выгрузки.
 #:
-#: Кружок и голосовое MAX принимает только от своих клиентов: путь загрузки
-#: ``VideoNoteAttachment``/``VoiceAttachment`` сервер отвергает с
-#: ``video.not.supported`` при любом кодеке (проверено на opus, aac, mp3 и
-#: h264 baseline). Поэтому кружок уходит обычным видео, а голосовое — файлом:
+#: Кружок уходит в отдельную ячейку загрузки (``VideoNoteAttachment``), а в
+#: сообщении описывается как видео с длительностью — именно так его отправляет
+#: клиент MAX, и только тогда он показывается круглым.
+#:
+#: Голосовое MAX от нас не принимает: файл заливается и доступен по ссылке, но
+#: сообщение с вложением ``AUDIO`` сервер отвергает (``video.not.supported``)
+#: при любом наборе полей и любом кодеке. Поэтому оно едет файлом с пометкой —
 #: содержимое доезжает целиком, теряется только форма подачи.
 UPLOAD_TYPES: dict[AttachmentKind, type] = {
     AttachmentKind.PHOTO: PhotoAttachment,
     AttachmentKind.VIDEO: VideoAttachment,
     AttachmentKind.ANIMATION: VideoAttachment,
-    AttachmentKind.VIDEO_NOTE: VideoAttachment,
+    AttachmentKind.VIDEO_NOTE: VideoNoteAttachment,
     AttachmentKind.VOICE: FileAttachment,
     AttachmentKind.AUDIO: FileAttachment,
     AttachmentKind.DOCUMENT: FileAttachment,
@@ -137,8 +141,10 @@ UPLOAD_TYPES: dict[AttachmentKind, type] = {
 #: Пометки к вложениям, форму которых MAX не воспроизводит.
 DEGRADED_NOTES: dict[AttachmentKind, str] = {
     AttachmentKind.VOICE: "🎤 голосовое сообщение",
-    AttachmentKind.VIDEO_NOTE: "⭕ видеосообщение (кружок)",
 }
+
+#: Длительность по умолчанию для кружка, если Telegram её не прислал.
+DEFAULT_ROUND_DURATION_MS = 1000
 
 
 class MaxAdapter:
@@ -912,6 +918,8 @@ class MaxAdapter:
                 logger.warning("Не удалось загрузить %s в MAX: %s", filename, error)
                 message.notes.append(f"⚠️ «{filename}» не загружено в MAX: {error}")
                 continue
+            if kind is AttachmentKind.VIDEO_NOTE:
+                result = [_as_round(item, attachment.duration) for item in result]
             uploaded.extend(result)
         return uploaded
 
@@ -1200,3 +1208,36 @@ def _restore_context(attach: Any, message: Message) -> None:
         if getattr(attach, field, None) is None and value is not None:
             with suppress(Exception):
                 setattr(attach, field, value)
+
+
+class _RoundVideo:
+    """Кружок в том виде, в каком его описывает клиент MAX.
+
+    pyromax отправляет видеосообщение без длительности, и сервер отвечает
+    ``video.not.supported``. Клиент же шлёт обычный ``VIDEO`` с ``duration`` —
+    круглым его делает ячейка загрузки, а не тип вложения.
+    """
+
+    is_attach = True
+
+    def __init__(self, video_id: int, token: str, duration_ms: int) -> None:
+        self._payload = {
+            "_type": "VIDEO",
+            "videoId": video_id,
+            "token": token,
+            "duration": duration_ms,
+        }
+
+    @property
+    def to_payload(self) -> list[dict[str, Any]]:
+        return [dict(self._payload)]
+
+
+def _as_round(uploaded: Any, duration_seconds: int | None) -> Any:
+    """Переписать загруженное видеосообщение в понятный MAX вид."""
+    video_id = getattr(uploaded, "video_id", None)
+    token = getattr(uploaded, "token", None)
+    if video_id is None or token is None:
+        return uploaded
+    duration_ms = int(duration_seconds * 1000) if duration_seconds else DEFAULT_ROUND_DURATION_MS
+    return _RoundVideo(int(video_id), str(token), duration_ms)

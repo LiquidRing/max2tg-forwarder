@@ -148,6 +148,12 @@ START_TEXT = (
     "Подробности: /help"
 )
 
+#: Отказ, когда группой распоряжается другой человек.
+NOT_YOURS = (
+    "Этой группой распоряжается кто-то другой: менять привязку может "
+    "администратор группы, а если она уже привязана — владелец её аккаунта MAX."
+)
+
 #: Сколько чатов показывать кнопками — дальше список превращается в простыню.
 BIND_BUTTONS_LIMIT = 12
 
@@ -214,8 +220,9 @@ class TelegramAdapter:
         #: Имя бота нужно, чтобы приглашать его в создаваемые группы.
         self._username: str = ""
         self._bot_id: int = 0
-        self._sync_task: asyncio.Task[None] | None = None
-        self._selftest_task: asyncio.Task[None] | None = None
+        #: Синхронизации и самопроверки идут параллельно у разных людей.
+        self._sync_tasks: dict[int, asyncio.Task[None]] = {}
+        self._selftest_tasks: dict[int, asyncio.Task[None]] = {}
         self._history_task: asyncio.Task[None] | None = None
         #: Незавершённые шаги входа: id пользователя -> ожидаемый ответ.
         self._login_flows: dict[int, str] = {}
@@ -399,6 +406,50 @@ class TelegramAdapter:
         if user_id is None:
             return False
         return account.owner_id == user_id or user_id in self._settings.tg_admin_ids
+
+    async def _is_group_admin(self, chat_id: int, user_id: int | None) -> bool:
+        """Распоряжается ли человек этой группой Telegram.
+
+        Иначе любой участник мог бы перевесить общую группу на свой аккаунт MAX
+        и тихо читать её переписку у себя.
+        """
+        if user_id is None:
+            return False
+        try:
+            member = await self.bot.get_chat_member(chat_id, user_id)
+        except Exception:
+            logger.debug("Не удалось проверить права в чате %s", chat_id, exc_info=True)
+            return False
+        return member.status in {"administrator", "creator"}
+
+    async def _may_manage_chat(self, chat_id: int, chat_type: str, user_id: int | None) -> bool:
+        """Может ли человек менять привязку этой группы.
+
+        Право даёт либо администратор моста, либо администратор самой группы:
+        мост обслуживает многих, и хозяин одной группы не должен решать за
+        соседнюю.
+        """
+        if self._is_admin(user_id):
+            return True
+        if chat_type == ChatType.PRIVATE:
+            return False
+        if not await self._is_group_admin(chat_id, user_id):
+            return False
+
+        binding = await self._storage.get_by_tg(chat_id)
+        if binding is None:
+            return True
+        account = await self._storage.get_account(binding.account_id)
+        # Уже привязанную группу трогает только владелец её аккаунта MAX.
+        return account is None or self._may_use(user_id, account)
+
+    async def _manage_allowed(self, message: TgMessage) -> bool:
+        """Та же проверка прав, но для обычной команды в чате."""
+        return await self._may_manage_chat(
+            message.chat.id,
+            str(message.chat.type),
+            message.from_user.id if message.from_user else None,
+        )
 
     def _may_signup(self, user_id: int | None) -> bool:
         """Разрешено ли этому человеку подключать свои аккаунты."""
@@ -588,8 +639,8 @@ class TelegramAdapter:
         await self._switch_forwarding(message, enabled=True)
 
     async def _switch_forwarding(self, message: TgMessage, *, enabled: bool) -> None:
-        if not self._is_admin(message.from_user.id if message.from_user else None):
-            await message.answer("Команда доступна только администраторам моста.")
+        if not await self._manage_allowed(message):
+            await message.answer(NOT_YOURS)
             return
         binding = await self._storage.get_by_tg(message.chat.id)
         if binding is None:
@@ -643,6 +694,9 @@ class TelegramAdapter:
     async def _cmd_bind(self, message: TgMessage, command: CommandObject) -> None:
         if message.chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
             await message.answer("Привязывать можно только группу: добавьте бота в группу.")
+            return
+        if not await self._manage_allowed(message):
+            await message.answer(NOT_YOURS)
             return
         account, raw, problem = await self._resolve_account(message, command.args)
         if account is None:
@@ -724,8 +778,8 @@ class TelegramAdapter:
         )
 
     async def _cmd_unbind(self, message: TgMessage) -> None:
-        if not self._is_admin(message.from_user.id if message.from_user else None):
-            await message.answer("Команда доступна только администраторам моста.")
+        if not await self._manage_allowed(message):
+            await message.answer(NOT_YOURS)
             return
         binding = await self._storage.get_by_tg(message.chat.id)
         if binding is None:
@@ -754,8 +808,12 @@ class TelegramAdapter:
             await callback.answer()
             return
 
-        if not self._is_admin(user_id):
-            await callback.answer("Только для администраторов моста.", show_alert=True)
+        may_manage = await self._may_manage_chat(message.chat.id, str(message.chat.type), user_id)
+        if data.startswith(("unbind:", "bind:")) and not may_manage:
+            await callback.answer("Этой группой распоряжается кто-то другой.", show_alert=True)
+            return
+        if data.startswith("start:") and not self._may_signup(user_id):
+            await callback.answer("Подключение к мосту закрыто.", show_alert=True)
             return
 
         if data.startswith("start:"):
@@ -845,8 +903,10 @@ class TelegramAdapter:
     async def _cmd_login(self, message: TgMessage, command: CommandObject) -> None:
         """Начать вход в пользовательскую сессию Telegram прямо из чата с ботом."""
         user_id = message.from_user.id if message.from_user else None
-        if not self._is_admin(user_id):
-            await message.answer("Команда доступна только администраторам моста.")
+        if not self._may_signup(user_id):
+            await message.answer(
+                "Подключение к мосту сейчас закрыто — обратитесь к его администратору."
+            )
             return
         if message.chat.type != ChatType.PRIVATE:
             await message.answer(
@@ -953,15 +1013,16 @@ class TelegramAdapter:
 
     async def _cmd_selftest(self, message: TgMessage, command: CommandObject) -> None:
         """Прогнать проверочные сообщения в обе стороны и отчитаться."""
-        if not self._is_admin(message.from_user.id if message.from_user else None):
-            await message.answer("Команда доступна только администраторам моста.")
+        if not await self._manage_allowed(message):
+            await message.answer(NOT_YOURS)
             return
         binding = await self._storage.get_by_tg(message.chat.id)
         if binding is None:
             await message.answer("Группа не привязана — сначала /bind или /sync.")
             return
-        if self._selftest_task is not None and not self._selftest_task.done():
-            await message.answer("Самопроверка уже идёт — дождитесь отчёта.")
+        running = self._selftest_tasks.get(message.chat.id)
+        if running is not None and not running.done():
+            await message.answer("Самопроверка в этой группе уже идёт — дождитесь отчёта.")
             return
 
         full = (command.args or "").strip().lower() in {"full", "полный", "все", "всё"}
@@ -970,7 +1031,7 @@ class TelegramAdapter:
             f"Самопроверка <code>{nonce}</code> запущена"
             f"{' (полная матрица)' if full else ''}. Сообщения ниже — проверочные."
         )
-        self._selftest_task = asyncio.create_task(
+        self._selftest_tasks[message.chat.id] = asyncio.create_task(
             self._run_selftest(
                 message.chat.id,
                 binding.max_chat_id,
@@ -1200,11 +1261,16 @@ class TelegramAdapter:
 
     async def _cmd_sync(self, message: TgMessage, command: CommandObject) -> None:
         """Создать недостающие группы под чаты MAX и обновить папку."""
-        if not self._is_admin(message.from_user.id if message.from_user else None):
-            await message.answer("Команда доступна только администраторам моста.")
+        user_id = message.from_user.id if message.from_user else None
+        if not self._may_signup(user_id):
+            await message.answer(
+                "Подключение к мосту сейчас закрыто — обратитесь к его администратору."
+            )
             return
-        if self._sync_task is not None and not self._sync_task.done():
-            await message.answer("Синхронизация уже идёт — дождитесь отчёта.")
+        # Своя очередь на каждого: чужая синхронизация не должна мешать.
+        running = self._sync_tasks.get(user_id or 0)
+        if running is not None and not running.done():
+            await message.answer("Ваша синхронизация уже идёт — дождитесь отчёта.")
             return
 
         folder = (command.args or "").strip() or self._settings.tg_folder_name
@@ -1212,7 +1278,7 @@ class TelegramAdapter:
             f"Синхронизирую чаты MAX с папкой <b>{escape_html(folder)}</b>. "
             "Это займёт время: Telegram ограничивает частоту создания групп."
         )
-        self._sync_task = asyncio.create_task(
+        self._sync_tasks[user_id or 0] = asyncio.create_task(
             self._sync_accounts(message, folder), name="max2tg-sync"
         )
 

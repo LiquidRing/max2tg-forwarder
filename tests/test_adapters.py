@@ -1322,3 +1322,41 @@ async def test_long_message_keeps_every_part_mapped(storage: Storage) -> None:
         account_id=1,
     )
     assert await storage.count_messages(TG_CHAT) == 3
+
+
+@pytest.mark.asyncio
+async def test_stranger_manages_only_their_own_chats(storage: Storage) -> None:
+    """Чужую группу посторонний не перевесит на свой аккаунт MAX."""
+    from aiogram.enums import ChatType
+
+    # Пустой TG_ADMIN_IDS означает «командуют все» — здесь нужен настоящий мост
+    # с назначенным администратором.
+    adapter = TelegramAdapter(
+        make_settings(TG_ADMIN_IDS=[1]),
+        storage,
+        DummyDirectory(),
+        await _collect([]),
+    )
+    try:
+        owner, stranger = 7, 99
+        account = await storage.add_account(owner_id=owner, nickname="Хозяин")
+        await storage.bind(TG_CHAT, MAX_CHAT, "Чат", account_id=account.id)
+
+        admins: set[int] = {owner, stranger}
+
+        async def group_admin(chat_id: int, user_id: int | None) -> bool:
+            return user_id in admins
+
+        adapter._is_group_admin = group_admin  # type: ignore[method-assign]
+
+        # Владелец аккаунта распоряжается своей группой.
+        assert await adapter._may_manage_chat(TG_CHAT, ChatType.SUPERGROUP, owner) is True
+        # Администратор группы, но чужой аккаунт MAX — доступа нет.
+        assert await adapter._may_manage_chat(TG_CHAT, ChatType.SUPERGROUP, stranger) is False
+        # Свободную группу может привязать её администратор.
+        assert await adapter._may_manage_chat(-4242, ChatType.SUPERGROUP, stranger) is True
+        # Не администратор группы — мимо.
+        admins.discard(stranger)
+        assert await adapter._may_manage_chat(-4242, ChatType.SUPERGROUP, stranger) is False
+    finally:
+        await adapter.bot.session.close()

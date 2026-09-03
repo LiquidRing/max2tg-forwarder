@@ -1,0 +1,19 @@
+[Unit]
+Description=Мост MAX <-> Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/max2tg-forwarder
+ExecStart=%h/.local/bin/uv run --frozen python -u -m max2tg
+Environment=PYTHONIOENCODING=utf-8
+Environment=PYTHONUNBUFFERED=1
+Environment=LANG=C.UTF-8
+Restart=always
+RestartSec=10
+# Мост переживает обрывы сети сам; перезапуск нужен только на настоящие падения.
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=default.target

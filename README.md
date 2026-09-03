@@ -227,7 +227,7 @@ scp tokens.json ubuntu@сервер:~/max2tg-forwarder/state/tokens.json
 ```
 
 В `.env` на сервере укажите `STATE_DIR=./state`, а файл закройте от посторонних:
-`chmod 600 .env`. Юнит кладётся в `~/.config/systemd/user/max2tg.service`:
+`chmod 600 .env`. Готовый юнит лежит в [`deploy/max2tg.service`](deploy/max2tg.service) — скопируйте его в `~/.config/systemd/user/max2tg.service`:
 
 ```ini
 [Unit]

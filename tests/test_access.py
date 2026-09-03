@@ -309,3 +309,78 @@ async def test_sync_runs_per_person_without_blocking_others(bridge) -> None:
     assert not any("уже идёт" in text for text in replies), replies
     for pending in adapter._sync_tasks.values():
         pending.cancel()
+
+
+@pytest.mark.asyncio
+async def test_same_chat_id_in_two_accounts_never_crosses(storage: Storage) -> None:
+    """Чат «Избранное» имеет номер 0 у каждого аккаунта MAX.
+
+    Если маршрут искать только по номеру чата, переписка одного человека
+    попадёт в группу другого — поэтому маршрут всегда включает аккаунт.
+    """
+    from max2tg.bridge import Bridge
+    from max2tg.models import Platform
+
+    mine = await storage.add_account(owner_id=OWNER, nickname="Мой")
+    theirs = await storage.add_account(owner_id=STRANGER, nickname="Чужой")
+    await storage.bind(GROUP, 0, "Избранное", account_id=mine.id)
+    await storage.bind(OTHER_GROUP, 0, "Избранное", account_id=theirs.id)
+
+    bridge = Bridge(storage)
+
+    mine_message = NormalizedMessage(
+        source=Platform.MAX,
+        source_chat_id=0,
+        source_message_id="m1",
+        account_id=mine.id,
+        author="Я",
+        text="моё",
+    )
+    theirs_message = NormalizedMessage(
+        source=Platform.MAX,
+        source_chat_id=0,
+        source_message_id="m2",
+        account_id=theirs.id,
+        author="Он",
+        text="чужое",
+    )
+
+    assert await bridge._resolve_route(mine_message) == (Platform.TELEGRAM, GROUP)
+    assert await bridge._resolve_route(theirs_message) == (Platform.TELEGRAM, OTHER_GROUP)
+
+    # Обратный путь тоже разводит людей: группа знает свой аккаунт.
+    from_group = NormalizedMessage(
+        source=Platform.TELEGRAM,
+        source_chat_id=OTHER_GROUP,
+        source_message_id="42",
+        author="Я",
+        text="ответ",
+    )
+    assert await bridge._resolve_route(from_group) == (Platform.MAX, 0)
+    assert from_group.account_id == theirs.id
+
+
+@pytest.mark.asyncio
+async def test_account_limit_and_private_only_signup(bridge) -> None:
+    """Аккаунтов на человека — не больше настроенного, и только из лички."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    limit = adapter._settings.max_accounts_per_user
+
+    for index in range(limit):
+        await storage.add_account(owner_id=STRANGER, nickname=f"Аккаунт {index}")
+
+    replies: list[str] = []
+    await adapter._cmd_max_add(
+        _patch_answer(_message(STRANGER, STRANGER, "private"), replies),
+        CommandObject(command="max_add", args=None),
+    )
+    assert replies and "предел" in replies[-1].lower()
+    assert len(await storage.list_accounts(STRANGER)) == limit
+
+    # В группе подключать аккаунт нельзя: QR-код увидели бы все участники.
+    replies.clear()
+    await adapter._cmd_max_add(
+        _patch_answer(_message(OWNER), replies), CommandObject(command="max_add", args=None)
+    )
+    assert replies and "в личке" in replies[-1].lower()

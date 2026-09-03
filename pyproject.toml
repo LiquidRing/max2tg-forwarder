@@ -3,6 +3,8 @@ name = "max2tg-forwarder"
 version = "0.1.0"
 description = "Двусторонний мост между чатами MAX Messenger и группами Telegram"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
     "aiogram>=3.31.0",

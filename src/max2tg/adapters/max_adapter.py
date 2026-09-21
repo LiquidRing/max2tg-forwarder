@@ -160,10 +160,14 @@ class MaxAdapter:
         account_id: int = 0,
         token: str | None = None,
         nickname: str = "MAX",
+        password: str | None = None,
     ) -> None:
         self._settings = settings
         self._storage = storage
         self._on_message = on_message
+        #: Пароль двухфакторной защиты именно этого аккаунта. Общей настройкой
+        #: он быть не может: чужой аккаунт получил бы пароль владельца моста.
+        self._password = password
         #: Аккаунт MAX, который обслуживает эта сессия.
         self.account_id = account_id
         self.nickname = nickname
@@ -191,7 +195,7 @@ class MaxAdapter:
         logger.info("Подключаемся к MAX (device_type=%s)...", self._settings.max_device_type)
         self._api = await MaxApi(
             device_type=self._settings.max_device_type,
-            password=self._settings.max_password,
+            password=self._password,
             token=self._token,
             token_suffix=self._token_suffix(),
             url_callback=self._qr_callback or self._show_login_qr,

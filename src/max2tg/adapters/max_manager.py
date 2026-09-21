@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -39,6 +40,8 @@ class MaxAccountManager:
         self._on_message = on_message
         self._sessions: dict[int, MaxAdapter] = {}
         self._tasks: dict[int, asyncio.Task[None]] = {}
+        #: Сессии, которые ещё входят в MAX (ждут сканирования QR-кода).
+        self._pending: dict[int, MaxAdapter] = {}
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл
@@ -46,6 +49,7 @@ class MaxAccountManager:
 
     async def start_all(self) -> int:
         """Поднять сессии всех аккаунтов, у которых есть сохранённый токен."""
+        await self._purge_unfinished()
         started = 0
         for account in await self._storage.list_accounts():
             if not account.enabled or not account.token:
@@ -63,6 +67,24 @@ class MaxAccountManager:
             except Exception:
                 logger.exception("Не удалось поднять аккаунт MAX %s", account.id)
         return started
+
+    async def _purge_unfinished(self) -> None:
+        """Убрать аккаунты, вход в которые так и не завершили.
+
+        Строка заводится в момент /max_add, а токен появляется только после
+        сканирования QR-кода. Брошенный вход оставлял запись без токена: она
+        занимала слот из ``MAX_ACCOUNTS_PER_USER`` и ничего не делала. Аккаунты
+        с привязками не трогаем — у них просто нет токена (нужен повторный вход).
+        """
+        for account in await self._storage.list_accounts():
+            if account.token or await self._storage.list_bindings(account.id):
+                continue
+            await self._storage.remove_account(account.id)
+            logger.info(
+                "Убран недоведённый аккаунт %s (%s): вход в MAX не был завершён",
+                account.id,
+                account.nickname,
+            )
 
     async def start_account(
         self,
@@ -83,9 +105,16 @@ class MaxAccountManager:
             account_id=account_id,
             token=token,
             nickname=nickname,
+            password=await self._password_for(account_id),
         )
         session.set_qr_callback(qr_callback)
-        await session.start()
+        # Пока вход не завершён, сессию нужно уметь остановить снаружи: иначе
+        # брошенный вход повторяет попытки, пока не перезапустят мост.
+        self._pending[account_id] = session
+        try:
+            await session.start()
+        finally:
+            self._pending.pop(account_id, None)
         session.set_qr_callback(None)
 
         self._sessions[account_id] = session
@@ -94,6 +123,27 @@ class MaxAccountManager:
         )
         logger.info("Аккаунт MAX %s (%s) подключён", account_id, session.nickname)
         return session
+
+    async def abort_login(self, account_id: int) -> None:
+        """Прервать вход, который так и не завершился, и закрыть его соединение."""
+        session = self._pending.pop(account_id, None)
+        if session is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(session.stop(), timeout=10.0)
+
+    async def _password_for(self, account_id: int) -> str | None:
+        """Пароль двухфакторной защиты MAX для аккаунта.
+
+        ``MAX_PASSWORD`` из .env — пароль аккаунта владельца моста, поэтому он
+        подходит только аккаунтам администраторов. Остальным его показывать
+        нельзя: MAX получил бы чужой пароль при входе в чужой аккаунт.
+        """
+        if not self._settings.max_password:
+            return None
+        account = await self._storage.get_account(account_id)
+        if account is not None and account.owner_id in self._settings.tg_admin_ids:
+            return self._settings.max_password
+        return None
 
     async def _run(self, account_id: int, session: MaxAdapter) -> None:
         """Слушать события аккаунта, переживая обрывы соединения."""

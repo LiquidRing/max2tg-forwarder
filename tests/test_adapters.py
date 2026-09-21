@@ -503,7 +503,7 @@ async def test_login_flow_strips_separators_from_code(storage: Storage) -> None:
     """Код, присланный через дефисы, доходит до Telethon чистыми цифрами."""
     userbot = _LoginUserbot()
     adapter = TelegramAdapter(
-        make_settings(tg_phone="+79990000000"),
+        make_settings(),
         storage,
         DummyDirectory(),
         await _collect([]),
@@ -511,7 +511,9 @@ async def test_login_flow_strips_separators_from_code(storage: Storage) -> None:
     )
     try:
         answers: list[str] = []
-        await adapter._cmd_login(_PrivateMessage("/login", answers), _FakeCommand(""))
+        await adapter._cmd_login(
+            _PrivateMessage("/login +79990000000", answers), _FakeCommand("+79990000000")
+        )
         assert userbot.phones == ["+79990000000"]
         assert "1-2-3-4-5" in answers[0]
 
@@ -529,7 +531,7 @@ async def test_login_flow_asks_for_two_factor_password(storage: Storage) -> None
     """При включённой двухфакторной защите бот просит пароль вторым шагом."""
     userbot = _LoginUserbot(needs_password=True)
     adapter = TelegramAdapter(
-        make_settings(tg_phone="+79990000000"),
+        make_settings(),
         storage,
         DummyDirectory(),
         await _collect([]),
@@ -538,7 +540,9 @@ async def test_login_flow_asks_for_two_factor_password(storage: Storage) -> None
     try:
         answers: list[str] = []
         adapter.bot.delete_message = _fail_delete
-        await adapter._cmd_login(_PrivateMessage("/login", answers), _FakeCommand(""))
+        await adapter._cmd_login(
+            _PrivateMessage("/login +79990000000", answers), _FakeCommand("+79990000000")
+        )
         await adapter._handle_private_message(_PrivateMessage("11111", answers))
         assert "пароль" in answers[-1].lower()
         assert adapter._login_flows == {7: "password"}
@@ -1360,3 +1364,82 @@ async def test_stranger_manages_only_their_own_chats(storage: Storage) -> None:
         assert await adapter._may_manage_chat(-4242, ChatType.SUPERGROUP, stranger) is False
     finally:
         await adapter.bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_login_never_uses_the_owners_phone_from_env(storage: Storage) -> None:
+    """Код входа уходит на номер самого человека, а не на TG_PHONE владельца.
+
+    Раньше `/login` без номера подставлял общую настройку — второй пользователь
+    получал запрос кода на телефон владельца моста.
+    """
+    userbot = _LoginUserbot()
+    adapter = TelegramAdapter(
+        make_settings(TG_PHONE="+70000000001"),
+        storage,
+        DummyDirectory(),
+        await _collect([]),
+        _FakePool(userbot),  # type: ignore[arg-type]
+    )
+    try:
+        answers: list[str] = []
+        adapter.bot.delete_message = _fail_delete
+
+        await adapter._cmd_login(_PrivateMessage("/login", answers), _FakeCommand(""))
+        # Код не запрошен ни на чей номер: бот спрашивает номер у человека.
+        assert userbot.phones == []
+        assert adapter._login_flows == {7: "phone"}
+        assert "номер" in answers[-1].lower()
+
+        # Номер в привычной записи приводится к международному виду.
+        await adapter._handle_private_message(_PrivateMessage("8 (999) 111-22-33", answers))
+        assert userbot.phones == ["+79991112233"]
+        assert adapter._login_flows == {7: "code"}
+        assert "1-2-3-4-5" in answers[-1]
+    finally:
+        await adapter.bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_login_rejects_garbage_instead_of_phone(storage: Storage) -> None:
+    """Мусор вместо номера не уходит в Telegram, а вход остаётся на шаге номера."""
+    userbot = _LoginUserbot()
+    adapter = TelegramAdapter(
+        make_settings(),
+        storage,
+        DummyDirectory(),
+        await _collect([]),
+        _FakePool(userbot),  # type: ignore[arg-type]
+    )
+    try:
+        answers: list[str] = []
+        adapter.bot.delete_message = _fail_delete
+        await adapter._cmd_login(_PrivateMessage("/login", answers), _FakeCommand(""))
+
+        for garbage in ("привет", "12345", "+7 999 abc 22 33", ""):
+            await adapter._handle_private_message(_PrivateMessage(garbage, answers))
+            assert userbot.phones == [], garbage
+            assert adapter._login_flows == {7: "phone"}, garbage
+
+        # Ошибочный номер в самой команде тоже отсекается.
+        await adapter._cmd_login(_PrivateMessage("/login abc", answers), _FakeCommand("abc"))
+        assert userbot.phones == []
+        assert "формате" in answers[-1]
+    finally:
+        await adapter.bot.session.close()
+
+
+def test_normalize_phone_accepts_human_formats() -> None:
+    """Номер понимается в тех записях, в которых его пишут люди."""
+    from max2tg.adapters.telegram_adapter import normalize_phone
+
+    assert normalize_phone("+79991234567") == "+79991234567"
+    assert normalize_phone("+7 (999) 123-45-67") == "+79991234567"
+    assert normalize_phone("8 999 123-45-67") == "+79991234567"
+    assert normalize_phone("  79991234567 ") == "+79991234567"
+    assert normalize_phone("+380501234567") == "+380501234567"
+    # Восьмёрка с плюсом — не российская запись: её не переписываем.
+    assert normalize_phone("+81312345678") == "+81312345678"
+
+    for bad in ("", "abc", "12345", "+7 999 abc 22 33", "1" * 16, "+7999123456x"):
+        assert normalize_phone(bad) is None, bad

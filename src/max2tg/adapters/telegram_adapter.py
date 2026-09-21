@@ -19,6 +19,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.enums import ChatType, ParseMode
 from aiogram.exceptions import (
     TelegramBadRequest,
+    TelegramForbiddenError,
     TelegramRetryAfter,
     TelegramUnauthorizedError,
 )
@@ -146,6 +147,31 @@ START_TEXT = (
     "Не хотите входить сессией — создайте группу сами, добавьте меня "
     "администратором и выполните /bind.\n\n"
     "Подробности: /help"
+)
+
+#: У аккаунта MAX включена двухфакторная защита, а пароль боту передать негде.
+TWO_FACTOR_UNSUPPORTED = (
+    "У этого аккаунта MAX включена двухфакторная защита, а подключать такие "
+    "аккаунты через бота пока нельзя: пароль пришлось бы передавать в переписке. "
+    "Отключите её в настройках MAX на время подключения и повторите /max_add."
+)
+
+#: QR-код входа в MAX так и не отсканировали.
+LOGIN_TIMED_OUT = (
+    "QR-код входа в MAX не отсканирован вовремя, попытку отменил. "
+    "Повторите /max_add, когда будете готовы отсканировать код."
+)
+
+#: Вход в свою сессию Telegram начинается с номера самого человека.
+LOGIN_PHONE_PROMPT = (
+    "Пришлите номер телефона <b>вашего</b> аккаунта Telegram в международном "
+    "формате, например <code>+79991234567</code>. Код подтверждения придёт "
+    "в Telegram на этот номер.\n\nОтменить: <code>/login cancel</code>"
+)
+
+LOGIN_PHONE_INVALID = (
+    "Не похоже на номер. Пришлите его в международном формате: "
+    "<code>+79991234567</code>. Отменить: <code>/login cancel</code>"
 )
 
 #: Отказ, когда группой распоряжается другой человек.
@@ -493,23 +519,82 @@ class TelegramAdapter:
             "или отсканируйте QR-код."
         )
 
-        async def send_login_link(url: str) -> None:
-            await self._send_login_qr(message.chat.id, url)
+        blocked = asyncio.Event()
 
-        try:
-            session = await self._accounts.start_account(
-                account.id, token=None, nickname=nickname, qr_callback=send_login_link
-            )
-        except Exception as error:
-            logger.exception("Не удалось подключить аккаунт MAX %s", account.id)
+        async def send_login_link(url: str) -> None:
+            try:
+                await self._send_login_qr(message.chat.id, url)
+            except TelegramForbiddenError:
+                # Человек заблокировал бота: QR ему не доставить. Исключение из
+                # колбэка pyromax принимает за сбой входа и повторяет его вечно,
+                # поэтому сообщаем об этом иначе и останавливаем вход сами.
+                blocked.set()
+
+        outcome = await self._connect_with_deadline(account.id, nickname, send_login_link, blocked)
+        if isinstance(outcome, str):
             await self._storage.remove_account(account.id)
+            if outcome:
+                await message.answer(outcome)
+            return
+        if isinstance(outcome, Exception):
+            error = outcome
+            logger.error("Не удалось подключить аккаунт MAX %s: %s", account.id, error)
+            await self._storage.remove_account(account.id)
+            if "2FA" in str(error) or "password is required" in str(error):
+                await message.answer(TWO_FACTOR_UNSUPPORTED)
+                return
             await message.answer(escape_html(f"Не удалось подключить аккаунт: {error}"))
             return
 
+        session = outcome
         await message.answer(
             f"✅ Аккаунт <b>{escape_html(session.nickname)}</b> подключён.\n"
             "Дальше: /sync — разложить чаты по группам, или /chats — посмотреть их список."
         )
+
+    async def _connect_with_deadline(
+        self,
+        account_id: int,
+        nickname: str,
+        send_login_link: Callable[[str], Awaitable[None]],
+        blocked: asyncio.Event,
+    ) -> Any:
+        """Дождаться входа в MAX, но не дольше отведённого времени.
+
+        Возвращает сессию MAX, исключение входа либо текст для человека (пустой —
+        сказать нечего: бот заблокирован, писать некуда). Тип сессии не назван
+        намеренно: адаптеры Telegram и MAX не импортируют друг друга.
+        """
+        login = asyncio.ensure_future(
+            self._accounts.start_account(
+                account_id, token=None, nickname=nickname, qr_callback=send_login_link
+            )
+        )
+        gave_up = asyncio.ensure_future(blocked.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                {login, gave_up},
+                timeout=self._settings.max_login_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if login in done:
+                try:
+                    return login.result()
+                except Exception as error:
+                    return error
+            reason = "" if blocked.is_set() else LOGIN_TIMED_OUT
+            logger.warning(
+                "Вход в MAX для аккаунта %s прерван: %s",
+                account_id,
+                "бот заблокирован пользователем" if blocked.is_set() else "истекло время",
+            )
+            return reason
+        finally:
+            gave_up.cancel()
+            if not login.done():
+                login.cancel()
+                await self._accounts.abort_login(account_id)
+                await asyncio.gather(login, return_exceptions=True)
 
     async def _send_login_qr(self, chat_id: int, url: str) -> None:
         """Отправить пользователю ссылку и QR-код для входа в MAX."""
@@ -941,23 +1026,34 @@ class TelegramAdapter:
             )
             return
 
-        phone = argument or self._settings.tg_phone
-        if not phone:
-            await message.answer(
-                "Укажите номер: <code>/login +79991234567</code> (или заполните TG_PHONE в .env)."
-            )
+        # Номер всегда принадлежит тому, кто входит. Подставлять сюда общую
+        # настройку TG_PHONE нельзя: код ушёл бы владельцу моста, а не человеку.
+        if not argument:
+            self._login_flows[user_id] = "phone"
+            await message.answer(LOGIN_PHONE_PROMPT)
             return
 
+        phone = normalize_phone(argument)
+        if phone is None:
+            await message.answer(LOGIN_PHONE_INVALID)
+            return
+        await self._request_login_code(message, user_id, userbot, phone)
+
+    async def _request_login_code(
+        self, message: TgMessage, user_id: int, userbot: TelegramUserbot, phone: str
+    ) -> None:
+        """Попросить Telegram выслать код на номер человека и перейти к шагу кода."""
         try:
             await userbot.request_code(phone)
         except Exception as error:
             logger.exception("Не удалось запросить код входа")
+            self._login_flows.pop(user_id, None)
             await message.answer(escape_html(f"Не удалось запросить код: {error}"))
             return
 
         self._login_flows[user_id] = "code"
         await message.answer(
-            "Код отправлен в Telegram.\n\n"
+            "Код отправлен в Telegram на этот номер.\n\n"
             "⚠️ Пришлите его <b>через дефисы</b>, например <code>1-2-3-4-5</code>. "
             "Telegram аннулирует код, который увидит в переписке обычным числом.\n\n"
             "Сообщение с кодом я удалю сразу после проверки. Отменить: "
@@ -965,7 +1061,7 @@ class TelegramAdapter:
         )
 
     async def _handle_private_message(self, message: TgMessage) -> None:
-        """Ответы на шаги входа: код и пароль двухфакторной защиты."""
+        """Ответы на шаги входа: номер, код и пароль двухфакторной защиты."""
         user_id = message.from_user.id if message.from_user else None
         step = self._login_flows.get(user_id) if user_id is not None else None
         if step is None or user_id is None or self._userbots is None:
@@ -979,6 +1075,13 @@ class TelegramAdapter:
         if self._userbots is None:
             return
         userbot = await self._userbots.get(user_id)
+        if step == "phone":
+            phone = normalize_phone(payload)
+            if phone is None:
+                await message.answer(LOGIN_PHONE_INVALID)
+                return
+            await self._request_login_code(message, user_id, userbot, phone)
+            return
         try:
             if step == "code":
                 digits = re.sub(r"\D", "", payload)
@@ -2119,3 +2222,20 @@ def _button_title(title: str) -> str:
     """Подпись кнопки: Telegram обрезает длинные, лучше сделать это осмысленно."""
     clean = (title or "Чат MAX").strip()
     return clean if len(clean) <= 40 else clean[:39] + "…"
+
+
+def normalize_phone(text: str) -> str | None:
+    """Привести введённый человеком номер к международному виду ``+79991234567``.
+
+    Понимает пробелы, дефисы и скобки, а российскую запись с восьмёркой
+    (``8 999 123-45-67``) переводит в ``+7…`` — так номер обычно и пишут.
+    """
+    stripped = text.strip()
+    digits = re.sub(r"\D", "", stripped)
+    if not 10 <= len(digits) <= 15:
+        return None
+    if re.search(r"[^\d\s()+\-.]", stripped):
+        return None
+    if not stripped.startswith("+") and len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    return "+" + digits

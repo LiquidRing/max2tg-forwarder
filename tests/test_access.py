@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 from typing import Any
 
@@ -384,3 +385,113 @@ async def test_account_limit_and_private_only_signup(bridge) -> None:
         _patch_answer(_message(OWNER), replies), CommandObject(command="max_add", args=None)
     )
     assert replies and "в личке" in replies[-1].lower()
+
+
+class _LoginManager:
+    """Менеджер аккаунтов, вход которого можно завершить, сломать или не завершать."""
+
+    def __init__(self, behaviour: str) -> None:
+        self.behaviour = behaviour
+        self.aborted: list[int] = []
+        self.qr_sender: Any = None
+
+    async def start_account(self, account_id: int, token, nickname, qr_callback) -> object:
+        self.qr_sender = qr_callback
+        if self.behaviour == "ok":
+            return type("Session", (), {"nickname": "Егор"})()
+        if self.behaviour == "error":
+            raise RuntimeError("password is required to login in account with 2FA.")
+        await asyncio.Event().wait()  # вход, который так и не заканчивается
+        raise AssertionError("недостижимо")
+
+    async def abort_login(self, account_id: int) -> None:
+        self.aborted.append(account_id)
+
+
+def _adapter_with_manager(storage: Storage, manager: _LoginManager, timeout: float):
+    adapter = TelegramAdapter(
+        make_settings(MAX_LOGIN_TIMEOUT=timeout), storage, _Directory(), _sink
+    )
+    adapter._accounts = manager  # type: ignore[assignment]
+    return adapter
+
+
+@pytest.mark.asyncio
+async def test_login_that_never_finishes_is_aborted(storage: Storage) -> None:
+    """QR не отсканировали — вход прерывается, а не повторяется до перезапуска."""
+    manager = _LoginManager("hang")
+    adapter = _adapter_with_manager(storage, manager, timeout=0.2)
+    try:
+        outcome = await adapter._connect_with_deadline(5, "Егор", _noop, asyncio.Event())
+        assert isinstance(outcome, str) and "не отсканирован" in outcome
+        assert manager.aborted == [5]
+    finally:
+        await adapter.bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_login_stops_at_once_when_the_bot_is_blocked(storage: Storage) -> None:
+    """Бот заблокирован — QR не доставить, ждать таймаут незачем и писать некому."""
+    manager = _LoginManager("hang")
+    adapter = _adapter_with_manager(storage, manager, timeout=30.0)
+    try:
+        blocked = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.1, blocked.set)
+        started = asyncio.get_running_loop().time()
+        outcome = await adapter._connect_with_deadline(6, "Егор", _noop, blocked)
+        assert outcome == ""
+        assert asyncio.get_running_loop().time() - started < 5
+        assert manager.aborted == [6]
+    finally:
+        await adapter.bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_login_result_and_error_pass_through(storage: Storage) -> None:
+    """Успешный вход и ошибка входа доходят до вызывающего без потерь."""
+    ok = _adapter_with_manager(storage, _LoginManager("ok"), timeout=5.0)
+    broken = _adapter_with_manager(storage, _LoginManager("error"), timeout=5.0)
+    try:
+        session = await ok._connect_with_deadline(7, "Егор", _noop, asyncio.Event())
+        assert session.nickname == "Егор"
+        error = await broken._connect_with_deadline(8, "Егор", _noop, asyncio.Event())
+        assert isinstance(error, RuntimeError) and "2FA" in str(error)
+    finally:
+        await ok.bot.session.close()
+        await broken.bot.session.close()
+
+
+async def _noop(url: str) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_max_password_is_only_for_bridge_admin_accounts(storage: Storage) -> None:
+    """Пароль 2FA из .env принадлежит владельцу моста и чужим аккаунтам не даётся."""
+    from max2tg.adapters.max_manager import MaxAccountManager
+
+    manager = MaxAccountManager(make_settings(MAX_PASSWORD="пароль-владельца"), storage, _sink)
+    mine = await storage.add_account(owner_id=BRIDGE_ADMIN, nickname="Мой")
+    theirs = await storage.add_account(owner_id=STRANGER, nickname="Чужой")
+
+    assert await manager._password_for(mine.id) == "пароль-владельца"
+    assert await manager._password_for(theirs.id) is None
+    assert await manager._password_for(9999) is None
+
+
+@pytest.mark.asyncio
+async def test_unfinished_logins_are_purged_on_start(storage: Storage) -> None:
+    """Брошенный /max_add не занимает слот аккаунта после перезапуска."""
+    from max2tg.adapters.max_manager import MaxAccountManager
+
+    manager = MaxAccountManager(make_settings(), storage, _sink)
+    abandoned = await storage.add_account(owner_id=STRANGER, nickname="Брошенный")
+    legacy = await storage.add_account(owner_id=OWNER, nickname="Старый")
+    await storage.bind(GROUP, MAX_CHAT, "Чат", account_id=legacy.id)
+
+    await manager.start_all()
+
+    left = {item.id for item in await storage.list_accounts()}
+    assert abandoned.id not in left
+    # Аккаунт с привязками без токена — не мусор: ему нужен повторный вход.
+    assert legacy.id in left

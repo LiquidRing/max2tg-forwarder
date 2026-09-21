@@ -51,6 +51,8 @@ class Settings(BaseSettings):
     allow_public_signup: bool = Field(default=True, alias="ALLOW_PUBLIC_SIGNUP")
     # Сколько аккаунтов MAX разрешено подключить одному пользователю.
     max_accounts_per_user: int = Field(default=3, alias="MAX_ACCOUNTS_PER_USER")
+    # Сколько секунд ждать, пока человек отсканирует QR-код входа в MAX.
+    max_login_timeout: float = Field(default=300.0, alias="MAX_LOGIN_TIMEOUT")
 
     # --- MAX ---
     max_device_type: str = Field(default="WEB", alias="MAX_DEVICE_TYPE")

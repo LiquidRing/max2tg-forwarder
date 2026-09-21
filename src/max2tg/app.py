@@ -53,6 +53,7 @@ async def run_bridge(settings: Settings) -> None:
     userbots = UserbotPool(settings, storage)
     telegram_adapter = TelegramAdapter(settings, storage, accounts, bridge.submit, userbots)
 
+    accounts.set_lost_handler(telegram_adapter.notify_account_lost)
     bridge.register(accounts)
     bridge.register(telegram_adapter)
 

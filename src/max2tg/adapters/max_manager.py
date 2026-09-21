@@ -42,6 +42,7 @@ class MaxAccountManager:
         self._tasks: dict[int, asyncio.Task[None]] = {}
         #: Сессии, которые ещё входят в MAX (ждут сканирования QR-кода).
         self._pending: dict[int, MaxAdapter] = {}
+        self._on_lost: Callable[[int], Awaitable[None]] | None = None
 
     # ------------------------------------------------------------------ #
     # Жизненный цикл
@@ -145,24 +146,72 @@ class MaxAccountManager:
             return self._settings.max_password
         return None
 
+    def set_lost_handler(self, handler: Callable[[int], Awaitable[None]] | None) -> None:
+        """Кому сообщить, что сессия аккаунта оборвалась и сама не поднимется."""
+        self._on_lost = handler
+
     async def _run(self, account_id: int, session: MaxAdapter) -> None:
-        """Слушать события аккаунта, переживая обрывы соединения."""
+        """Слушать события аккаунта, сообщая, если слушать больше некому.
+
+        Обрывы сокета pyromax чинит сам; сюда управление возвращается, только
+        когда цикл событий закончился совсем. Раньше это оставалось незамеченным:
+        аккаунт молча переставал работать до перезапуска всего моста.
+        """
         try:
             await session.run()
+            logger.warning("Сессия аккаунта MAX %s закончила слушать события", account_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Сессия аккаунта MAX %s завершилась ошибкой", account_id)
 
+        # Дальше — только если сессию никто не останавливал намеренно.
+        if self._sessions.get(account_id) is not session:
+            return
+        self._sessions.pop(account_id, None)
+        self._tasks.pop(account_id, None)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(session.stop(), timeout=10.0)
+        if self._on_lost is not None:
+            with contextlib.suppress(Exception):
+                await self._on_lost(account_id)
+
+    async def reconnect_account(self, account_id: int) -> MaxAdapter:
+        """Поднять сессию заново по сохранённому токену — как при запуске моста."""
+        account = await self._storage.get_account(account_id)
+        token = await self._storage.account_token(account_id)
+        if account is None or not token:
+            raise RuntimeError("нет сохранённого токена — подключите аккаунт заново: /max_add")
+
+        await self.stop_account(account_id)
+        try:
+            # Просроченный токен превращает вход в ожидание QR-кода, которого никто
+            # не увидит, поэтому ждём ограниченное время и вход закрываем.
+            return await asyncio.wait_for(
+                self.start_account(account_id, token, account.nickname), timeout=90.0
+            )
+        except TimeoutError:
+            await self.abort_login(account_id)
+            raise RuntimeError(
+                "MAX не принял сохранённый вход — подключите аккаунт заново: /max_add"
+            ) from None
+
     async def stop_account(self, account_id: int) -> None:
-        """Отключить аккаунт и освободить его сессию."""
+        """Отключить аккаунт и освободить его сессию.
+
+        Сначала останавливается сама сессия (иначе pyromax переподключит её
+        после отмены задачи), затем задача слушателя — но не дольше положенного:
+        библиотека умеет проглатывать отмену, а зависшая остановка блокирует
+        команду, из которой её вызвали.
+        """
         task = self._tasks.pop(account_id, None)
-        if task is not None:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
         session = self._sessions.pop(account_id, None)
         if session is not None:
-            await session.stop()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(session.stop(), timeout=15.0)
+        if task is not None:
+            task.cancel()
+            await asyncio.wait({task}, timeout=10.0)
 
     async def stop(self) -> None:
         """Остановить все сессии."""

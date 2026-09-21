@@ -119,6 +119,7 @@ PRIVATE_COMMANDS = [
     ("start", "с чего начать"),
     ("max_add", "подключить аккаунт MAX"),
     ("max_list", "мои аккаунты MAX"),
+    ("max_reconnect", "переподключить аккаунт MAX"),
     ("login", "вход в свою сессию Telegram"),
     ("sync", "разложить чаты MAX по группам"),
     ("help", "справка"),
@@ -156,6 +157,13 @@ TWO_FACTOR_UNSUPPORTED = (
     "Отключите её в настройках MAX на время подключения и повторите /max_add."
 )
 
+#: Удаление аккаунта необратимо: токен стирается, вернуть можно только новым QR-кодом.
+REMOVE_ACCOUNT_WARNING = (
+    "Удалить аккаунт MAX <b>{name}</b>?\n"
+    "Его привязки исчезнут, а чтобы подключить его снова, придётся заново "
+    "отсканировать QR-код. Сами группы Telegram и переписка останутся."
+)
+
 #: QR-код входа в MAX так и не отсканировали.
 LOGIN_TIMED_OUT = (
     "QR-код входа в MAX не отсканирован вовремя, попытку отменил. "
@@ -174,6 +182,9 @@ LOGIN_PHONE_INVALID = (
     "<code>+79991234567</code>. Отменить: <code>/login cancel</code>"
 )
 
+#: Как часто /sync сообщает, сколько групп уже создано.
+SYNC_PROGRESS_EVERY = 5
+
 #: Отказ, когда группой распоряжается другой человек.
 NOT_YOURS = (
     "Этой группой распоряжается кто-то другой: менять привязку может "
@@ -190,7 +201,8 @@ HELP_TEXT = (
     "уходит в MAX.\n\n"
     "<b>Аккаунты MAX</b> (в личке с ботом)\n"
     "/max_add — подключить аккаунт MAX по QR-коду\n"
-    "/max_list — мои аккаунты и их состояние\n"
+    "/max_list — мои аккаунты, их состояние и кнопки управления\n"
+    "/max_reconnect [номер] — переподключить аккаунт, если связь пропала\n"
     "/max_remove &lt;номер&gt; — отключить аккаунт\n\n"
     "<b>Группы</b>\n"
     "/chats [фильтр] — список чатов MAX с их идентификаторами\n"
@@ -319,6 +331,7 @@ class TelegramAdapter:
         router.message.register(self._cmd_max_add, Command("max_add"))
         router.message.register(self._cmd_max_list, Command("max_list"))
         router.message.register(self._cmd_max_remove, Command("max_remove"))
+        router.message.register(self._cmd_max_reconnect, Command("max_reconnect"))
         router.message.register(self._cmd_chats, Command("chats"))
         router.message.register(self._cmd_bind, Command("bind"))
         router.message.register(self._cmd_unbind, Command("unbind"))
@@ -623,23 +636,163 @@ class TelegramAdapter:
         await self._send_account_list(message.chat.id, user_id)
 
     async def _send_account_list(self, chat_id: int, user_id: int | None) -> None:
-        """Список аккаунтов MAX с их состоянием — общий для команды и кнопки."""
+        """Список аккаунтов MAX с состоянием и кнопками — общий для команды и кнопки."""
         accounts = await self._owner_accounts(user_id)
         if not accounts:
             await self._send_chunks(chat_id, "Аккаунтов MAX пока нет. Добавить: /max_add")
             return
         lines = ["<b>Ваши аккаунты MAX</b>", ""]
+        rows: list[list[InlineKeyboardButton]] = []
         for account in accounts:
-            state = "подключён" if self._accounts.session(account.id) else "не подключён"
+            live = self._accounts.session(account.id) is not None
             bindings = await self._storage.list_bindings(account.id)
             lines.append(
-                f"<code>{account.id}</code> — {escape_html(account.nickname)} "
-                f"({state}, групп: {len(bindings)})"
+                f"{'🟢' if live else '🔴'} <code>{account.id}</code> — "
+                f"{escape_html(account.nickname)} "
+                f"({'на связи' if live else 'не подключён'}, групп: {len(bindings)})"
             )
-        await self._send_chunks(chat_id, "\n".join(lines))
+            title = _button_title(account.nickname)
+            buttons: list[InlineKeyboardButton] = []
+            if not live:
+                buttons.append(
+                    InlineKeyboardButton(
+                        text=f"Переподключить «{title}»",
+                        callback_data=f"acc:reconnect:{account.id}",
+                    )
+                )
+            buttons.append(
+                InlineKeyboardButton(
+                    text=f"Удалить «{title}»", callback_data=f"acc:remove:{account.id}"
+                )
+            )
+            rows.append(buttons)
+        await self._send_chunks(
+            chat_id,
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+
+    async def notify_account_lost(self, account_id: int) -> None:
+        """Сообщить владельцу, что сессия его аккаунта MAX оборвалась.
+
+        Без этого пересылка просто замолкала, и человек узнавал об этом, только
+        не дождавшись сообщения.
+        """
+        account = await self._storage.get_account(account_id)
+        if account is None or not account.owner_id:
+            return
+        with suppress(Exception):
+            await self._send_chunks(
+                account.owner_id,
+                f"⚠️ Аккаунт MAX <b>{escape_html(account.nickname)}</b> отключился — "
+                "сообщения из него и в него сейчас не ходят.\n"
+                "Обычно достаточно переподключить его кнопкой ниже.",
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Переподключить",
+                                callback_data=f"acc:reconnect:{account.id}",
+                            )
+                        ]
+                    ]
+                ),
+            )
+
+    async def _cmd_max_reconnect(self, message: TgMessage, command: CommandObject) -> None:
+        """Поднять сессию аккаунта MAX заново, не заводя его с нуля."""
+        user_id = message.from_user.id if message.from_user else None
+        argument = (command.args or "").strip()
+        accounts = await self._owner_accounts(user_id)
+        if argument.isdigit():
+            account = await self._storage.get_account(int(argument))
+            if account is None or not self._may_use(user_id, account):
+                await message.answer("Такого аккаунта нет или он принадлежит другому пользователю.")
+                return
+        elif len(accounts) == 1:
+            account = accounts[0]
+        else:
+            await message.answer(
+                "Укажите номер аккаунта: <code>/max_reconnect 2</code> (см. /max_list)"
+            )
+            return
+        await message.answer(await self._reconnect_account(account))
+
+    async def _reconnect_account(self, account: MaxAccount) -> str:
+        """Переподключить аккаунт и вернуть текст для человека."""
+        try:
+            await self._accounts.reconnect_account(account.id)
+        except Exception as error:
+            logger.warning("Не удалось переподключить аккаунт MAX %s: %s", account.id, error)
+            return escape_html(f"Не удалось переподключить: {error}")
+        return f"✅ Аккаунт <b>{escape_html(account.nickname)}</b> снова на связи."
+
+    async def _remove_account(self, account: MaxAccount) -> str:
+        """Отключить аккаунт и стереть его привязки; вернуть текст для человека."""
+        await self._accounts.stop_account(account.id)
+        await self._storage.remove_account(account.id)
+        return (
+            f"Аккаунт <b>{escape_html(account.nickname)}</b> отключён, его привязки удалены. "
+            "Сами группы Telegram остались на месте."
+        )
+
+    async def _callback_account(self, callback: CallbackQuery, payload: str) -> None:
+        """Кнопки аккаунтов: переподключить, удалить (с подтверждением)."""
+        message = callback.message
+        if message is None:
+            return
+        action, _, raw_id = payload.partition(":")
+        if action == "remove_no":
+            await callback.answer("Отменено.")
+            with suppress(Exception):
+                await self.bot.edit_message_text(
+                    "Отменено — аккаунт на месте.",
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                )
+            return
+        if not raw_id.isdigit():
+            await callback.answer("Не разобрал выбор.", show_alert=True)
+            return
+
+        account = await self._storage.get_account(int(raw_id))
+        if account is None or not self._may_use(callback.from_user.id, account):
+            await callback.answer("Аккаунт недоступен.", show_alert=True)
+            return
+
+        if action == "reconnect":
+            await callback.answer("Переподключаю…")
+            text = await self._reconnect_account(account)
+        elif action == "remove":
+            await callback.answer()
+            await self.bot.send_message(
+                message.chat.id,
+                REMOVE_ACCOUNT_WARNING.format(name=escape_html(account.nickname)),
+                reply_markup=InlineKeyboardMarkup(
+                    inline_keyboard=[
+                        [
+                            InlineKeyboardButton(
+                                text="Да, удалить", callback_data=f"acc:remove_yes:{account.id}"
+                            ),
+                            InlineKeyboardButton(text="Отмена", callback_data="acc:remove_no:0"),
+                        ]
+                    ]
+                ),
+            )
+            return
+        elif action == "remove_yes":
+            await callback.answer("Готово.")
+            text = await self._remove_account(account)
+        else:
+            await callback.answer()
+            return
+        with suppress(Exception):
+            await self.bot.edit_message_text(
+                text, chat_id=message.chat.id, message_id=message.message_id
+            )
 
     async def _cmd_max_remove(self, message: TgMessage, command: CommandObject) -> None:
-        """Отключить аккаунт MAX и убрать его привязки."""
+        """Отключить аккаунт MAX и убрать его привязки — после подтверждения."""
         user_id = message.from_user.id if message.from_user else None
         argument = (command.args or "").strip()
         if not argument.isdigit():
@@ -651,11 +804,20 @@ class TelegramAdapter:
         if account is None or not self._may_use(user_id, account):
             await message.answer("Такого аккаунта нет или он принадлежит другому пользователю.")
             return
-        await self._accounts.stop_account(account.id)
-        await self._storage.remove_account(account.id)
+        # Токен и привязки стираются насовсем, вернуть можно только повторным
+        # сканированием QR-кода — поэтому спрашиваем, как и в /unbind.
         await message.answer(
-            f"Аккаунт <b>{escape_html(account.nickname)}</b> отключён, его привязки удалены. "
-            "Сами группы Telegram остались на месте."
+            REMOVE_ACCOUNT_WARNING.format(name=escape_html(account.nickname)),
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Да, удалить", callback_data=f"acc:remove_yes:{account.id}"
+                        ),
+                        InlineKeyboardButton(text="Отмена", callback_data="acc:remove_no:0"),
+                    ]
+                ]
+            ),
         )
 
     async def _publish_commands(self) -> None:
@@ -906,6 +1068,9 @@ class TelegramAdapter:
             return
         if data.startswith("bind:"):
             await self._callback_bind(callback, data.removeprefix("bind:"))
+            return
+        if data.startswith("acc:"):
+            await self._callback_account(callback, data.removeprefix("acc:"))
             return
         if data == "unbind:no":
             await callback.answer("Отменено.")
@@ -1356,6 +1521,14 @@ class TelegramAdapter:
         await self._storage.remember_icon(tg_chat_id, chat.icon_url)
         return "ok"
 
+    async def _count_missing(self, chats: list[Any], account_id: int) -> int:
+        """Сколько групп этот прогон /sync создаст (с учётом лимита за раз)."""
+        missing = 0
+        for chat in chats:
+            if await self._storage.get_by_max(chat.id, account_id) is None:
+                missing += 1
+        return min(missing, self._settings.sync_group_limit)
+
     async def _userbot_for(self, account: MaxAccount) -> TelegramUserbot | None:
         """Сессия Telegram, от имени которой создаются группы аккаунта."""
         if self._userbots is None:
@@ -1443,6 +1616,7 @@ class TelegramAdapter:
             )
             return
 
+        to_create = await self._count_missing(chats, account.id)
         for chat in chats:
             binding = await self._storage.get_by_max(chat.id, account.id)
             if binding is not None:
@@ -1527,6 +1701,9 @@ class TelegramAdapter:
 
             await self._storage.bind(group.chat_id, chat.id, chat.title, account_id=account.id)
             created += 1
+            if created % SYNC_PROGRESS_EVERY == 0 and created < to_create:
+                # Создание групп занимает минуты: без вестей человек решает, что всё зависло.
+                await self._send_chunks(report_chat_id, f"Создано групп: {created} из {to_create}…")
             if history_limit > 0:
                 imported += await self._directory.import_history(account.id, chat.id, history_limit)
             if avatars_allowed:
@@ -2117,13 +2294,24 @@ class TelegramAdapter:
                 attachment.note = f"⚠️ «{attachment.filename}» не перенесено: {error}"
             return None
 
-    async def _send_chunks(self, chat_id: int, text: str, reply_to: int | None = None) -> list[str]:
-        """Отправить текст, разбив его на части по лимиту Bot API."""
+    async def _send_chunks(
+        self,
+        chat_id: int,
+        text: str,
+        reply_to: int | None = None,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> list[str]:
+        """Отправить текст, разбив его на части по лимиту Bot API.
+
+        Кнопки, если они есть, крепятся к последней части — к той, что человек
+        прочтёт последней и на которой ждёт действия."""
         if not text:
             return []
         sent: list[str] = []
-        for chunk in _split_text(text, TEXT_LIMIT):
+        chunks = _split_text(text, TEXT_LIMIT)
+        for index, chunk in enumerate(chunks):
             answer_to = reply_to if not sent else None
+            markup = reply_markup if index == len(chunks) - 1 else None
             try:
                 result = await self._call(
                     chat_id,
@@ -2133,6 +2321,7 @@ class TelegramAdapter:
                         text=chunk,
                         reply_to_message_id=answer_to,
                         disable_web_page_preview=True,
+                        reply_markup=markup,
                     ),
                 )
             except TelegramBadRequest as error:
@@ -2148,6 +2337,7 @@ class TelegramAdapter:
                         reply_to_message_id=answer_to,
                         parse_mode=None,
                         disable_web_page_preview=True,
+                        reply_markup=markup,
                     ),
                 )
             sent.append(str(result.message_id))

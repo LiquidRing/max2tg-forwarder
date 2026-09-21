@@ -1443,3 +1443,54 @@ def test_normalize_phone_accepts_human_formats() -> None:
 
     for bad in ("", "abc", "12345", "+7 999 abc 22 33", "1" * 16, "+7999123456x"):
         assert normalize_phone(bad) is None, bad
+
+
+@pytest.mark.asyncio
+async def test_sync_reports_progress_on_long_runs(storage: Storage) -> None:
+    """Долгий /sync сообщает ход дела, а не молчит до самого отчёта."""
+    from max2tg.adapters.telegram_adapter import SYNC_PROGRESS_EVERY
+
+    total = SYNC_PROGRESS_EVERY * 2 + 1
+    chats = [_remote(index, f"Чат {index}") for index in range(1, total + 1)]
+    userbot = _FakeUserbot()
+    adapter = TelegramAdapter(
+        make_settings(sync_create_delay=0, sync_avatar_delay=0, history_import_limit=0),
+        storage,
+        _ChatsDirectory(chats),
+        await _collect([]),
+        _FakePool(userbot),  # type: ignore[arg-type]
+    )
+    try:
+        sent: list[str] = []
+        adapter._send_chunks = _capture(sent)
+        await adapter._run_sync(TG_CHAT, "Папка", await _account(storage))
+
+        progress = [text for text in sent if text.endswith("…") and "Создано групп:" in text]
+        assert progress == [
+            f"Создано групп: {SYNC_PROGRESS_EVERY} из {total}…",
+            f"Создано групп: {SYNC_PROGRESS_EVERY * 2} из {total}…",
+        ]
+        # Короткий прогон не засоряет чат промежуточными сообщениями.
+        assert len(userbot.created) == total
+    finally:
+        await adapter.bot.session.close()
+
+
+@pytest.mark.asyncio
+async def test_short_sync_stays_quiet(storage: Storage) -> None:
+    """Пять групп и меньше — только итоговый отчёт."""
+    chats = [_remote(index, f"Чат {index}") for index in (1, 2, 3)]
+    adapter = TelegramAdapter(
+        make_settings(sync_create_delay=0, sync_avatar_delay=0, history_import_limit=0),
+        storage,
+        _ChatsDirectory(chats),
+        await _collect([]),
+        _FakePool(_FakeUserbot()),  # type: ignore[arg-type]
+    )
+    try:
+        sent: list[str] = []
+        adapter._send_chunks = _capture(sent)
+        await adapter._run_sync(TG_CHAT, "Папка", await _account(storage))
+        assert not any(text.endswith("…") for text in sent)
+    finally:
+        await adapter.bot.session.close()

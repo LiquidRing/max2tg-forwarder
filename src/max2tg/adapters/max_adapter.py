@@ -273,11 +273,33 @@ class MaxAdapter:
         await self._dispatcher.start_polling(max_api=self._api)
 
     async def stop(self) -> None:
-        """Остановить фоновые задачи адаптера."""
+        """Остановить адаптер: фоновые задачи и само соединение с MAX.
+
+        Отмены задачи слушателя мало: у pyromax есть свой менеджер жизненного
+        цикла, который переподключает сессию на любой сбой — в том числе на
+        нашу отмену. Без его остановки «удалённый» аккаунт оставался живым и
+        продолжал пересылать сообщения. Поэтому сначала снимаем его задачу,
+        затем закрываем соединение.
+        """
         for task in list(self._tasks):
             task.cancel()
         await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
+
+        api = self._api
+        if api is None:
+            return
+        mapper = getattr(api, "mapper", None)
+        manager = getattr(mapper, "_lifecycle_manager", None)
+        lifecycle_task = getattr(manager, "_manage_lifecycle_task", None)
+        if lifecycle_task is not None:
+            lifecycle_task.cancel()
+        close = getattr(mapper, "close", None)
+        if close is not None:
+            try:
+                await asyncio.wait_for(close(), timeout=10.0)
+            except Exception:
+                logger.debug("Закрытие соединения MAX не удалось", exc_info=True)
 
     @property
     def api(self) -> MaxApi:

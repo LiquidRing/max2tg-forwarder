@@ -98,13 +98,17 @@ class _Adapter:
     def __init__(self, adapter: TelegramAdapter) -> None:
         self.adapter = adapter
         self.replies: list[str] = []
+        self.markups: list[Any] = []
         self.group_admins: set[int] = set()
 
         async def answer(text: str, **kwargs: Any) -> None:
             self.replies.append(text)
 
-        async def send_chunks(chat_id: int, text: str, reply_to: int | None = None) -> None:
+        async def send_chunks(
+            chat_id: int, text: str, reply_to: int | None = None, reply_markup: Any = None
+        ) -> None:
             self.replies.append(text)
+            self.markups.append(reply_markup)
 
         async def group_admin(chat_id: int, user_id: int | None) -> bool:
             return user_id in self.group_admins
@@ -495,3 +499,319 @@ async def test_unfinished_logins_are_purged_on_start(storage: Storage) -> None:
     assert abandoned.id not in left
     # Аккаунт с привязками без токена — не мусор: ему нужен повторный вход.
     assert legacy.id in left
+
+
+def _button_texts(markup: Any) -> list[str]:
+    return [button.text for row in markup.inline_keyboard for button in row]
+
+
+def _callback(user_id: int, data: str, sink: list[str]) -> Any:
+    """Нажатие кнопки: ответы и правки перехватываются, сети нет."""
+    from aiogram.types import CallbackQuery
+
+    async def answer(text: str | None = None, **kwargs: Any) -> None:
+        sink.append(f"answer:{text}")
+
+    callback = CallbackQuery(
+        id="1",
+        from_user=User(id=user_id, is_bot=False, first_name="Кто-то"),
+        chat_instance="x",
+        data=data,
+        message=_message(user_id, user_id, "private"),
+    )
+    object.__setattr__(callback, "answer", answer)
+    return callback
+
+
+class _Accounts:
+    """Менеджер аккаунтов: помнит, кого остановили и переподключили."""
+
+    def __init__(self, live: set[int], fail_reconnect: bool = False) -> None:
+        self.live = live
+        self.stopped: list[int] = []
+        self.reconnected: list[int] = []
+        self.fail_reconnect = fail_reconnect
+
+    def session(self, account_id: int) -> object | None:
+        return object() if account_id in self.live else None
+
+    async def stop_account(self, account_id: int) -> None:
+        self.stopped.append(account_id)
+        self.live.discard(account_id)
+
+    async def reconnect_account(self, account_id: int) -> None:
+        if self.fail_reconnect:
+            raise RuntimeError("нет сохранённого токена")
+        self.reconnected.append(account_id)
+        self.live.add(account_id)
+
+
+async def _swallow_edit(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+@pytest.mark.asyncio
+async def test_account_list_offers_reconnect_only_for_dropped_accounts(bridge) -> None:
+    """Кнопка «Переподключить» есть у отвалившегося аккаунта, у живого — нет."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    live = await storage.add_account(owner_id=OWNER, nickname="Живой")
+    await storage.add_account(owner_id=OWNER, nickname="Мёртвый")
+    adapter._accounts = _Accounts({live.id})  # type: ignore[assignment]
+
+    await adapter._send_account_list(GROUP, OWNER)
+
+    texts = _button_texts(wrapper.markups[-1])
+    assert "Переподключить «Мёртвый»" in texts
+    assert "Переподключить «Живой»" not in texts
+    assert "Удалить «Живой»" in texts and "Удалить «Мёртвый»" in texts
+    assert "🟢" in wrapper.last and "🔴" in wrapper.last
+
+
+@pytest.mark.asyncio
+async def test_max_remove_asks_before_wiping_the_account(bridge) -> None:
+    """Удаление аккаунта необратимо — сначала подтверждение, и только потом стирание."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    adapter.bot.edit_message_text = _swallow_edit  # type: ignore[method-assign]
+    account = await storage.add_account(owner_id=OWNER, nickname="Хозяин")
+    manager = _Accounts({account.id})
+    adapter._accounts = manager  # type: ignore[assignment]
+
+    sent: list[str] = []
+    captured: dict[str, Any] = {}
+
+    async def answer(text: str, **kwargs: Any) -> None:
+        sent.append(text)
+        captured.update(kwargs)
+
+    message = _message(OWNER, OWNER, "private")
+    object.__setattr__(message, "answer", answer)
+    await adapter._cmd_max_remove(
+        message, CommandObject(command="max_remove", args=str(account.id))
+    )
+
+    # Одной командой ничего не стёрто: только вопрос с кнопками.
+    assert await storage.get_account(account.id) is not None
+    assert manager.stopped == []
+    assert "Удалить аккаунт" in sent[-1]
+    assert f"acc:remove_yes:{account.id}" in [
+        button.callback_data for row in captured["reply_markup"].inline_keyboard for button in row
+    ]
+
+    # «Отмена» оставляет всё как было.
+    sink: list[str] = []
+    await adapter._callback_account(_callback(OWNER, "x", sink), "remove_no:0")
+    assert await storage.get_account(account.id) is not None
+
+    # «Да» — стирает и останавливает сессию.
+    await adapter._callback_account(_callback(OWNER, "x", sink), f"remove_yes:{account.id}")
+    assert await storage.get_account(account.id) is None
+    assert manager.stopped == [account.id]
+
+
+@pytest.mark.asyncio
+async def test_stranger_cannot_press_other_peoples_account_buttons(bridge) -> None:
+    """Кнопки аккаунта работают только у его владельца."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    account = await storage.add_account(owner_id=OWNER, nickname="Хозяин")
+    manager = _Accounts({account.id})
+    adapter._accounts = manager  # type: ignore[assignment]
+
+    sink: list[str] = []
+    await adapter._callback_account(_callback(STRANGER, "x", sink), f"remove_yes:{account.id}")
+    await adapter._callback_account(_callback(STRANGER, "x", sink), f"reconnect:{account.id}")
+
+    assert await storage.get_account(account.id) is not None
+    assert manager.stopped == [] and manager.reconnected == []
+    assert sink.count("answer:Аккаунт недоступен.") == 2
+
+
+@pytest.mark.asyncio
+async def test_reconnect_restores_a_dropped_account(bridge) -> None:
+    """Команда поднимает отвалившийся аккаунт; ошибка объясняется словами."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    account = await storage.add_account(owner_id=OWNER, nickname="Хозяин")
+    manager = _Accounts(set())
+    adapter._accounts = manager  # type: ignore[assignment]
+
+    replies: list[str] = []
+    await adapter._cmd_max_reconnect(
+        _patch_answer(_message(OWNER, OWNER, "private"), replies),
+        CommandObject(command="max_reconnect", args=None),
+    )
+    assert manager.reconnected == [account.id]
+    assert "снова на связи" in replies[-1]
+
+    adapter._accounts = _Accounts(set(), fail_reconnect=True)  # type: ignore[assignment]
+    replies.clear()
+    await adapter._cmd_max_reconnect(
+        _patch_answer(_message(OWNER, OWNER, "private"), replies),
+        CommandObject(command="max_reconnect", args=str(account.id)),
+    )
+    assert "Не удалось переподключить" in replies[-1]
+    assert "нет сохранённого токена" in replies[-1]
+
+
+@pytest.mark.asyncio
+async def test_owner_is_told_when_the_max_session_drops(bridge) -> None:
+    """Потеря связи не остаётся тихой: владелец получает сообщение с кнопкой."""
+    wrapper, storage = bridge
+    adapter = wrapper.adapter
+    account = await storage.add_account(owner_id=OWNER, nickname="Хозяин")
+    orphan = await storage.add_account(owner_id=0, nickname="Ничей")
+
+    await adapter.notify_account_lost(account.id)
+    assert "отключился" in wrapper.last and "Хозяин" in wrapper.last
+    assert _button_texts(wrapper.markups[-1]) == ["Переподключить"]
+
+    # У аккаунта без владельца писать некому — и падать из-за этого нельзя.
+    before = len(wrapper.replies)
+    await adapter.notify_account_lost(orphan.id)
+    await adapter.notify_account_lost(9999)
+    assert len(wrapper.replies) == before
+
+
+class _DyingSession:
+    """Сессия MAX, слушать которую больше нечем."""
+
+    def __init__(self, error: bool) -> None:
+        self.error = error
+        self.stopped = False
+
+    async def run(self) -> None:
+        if self.error:
+            raise RuntimeError("обрыв")
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_manager_reports_a_session_that_ended_by_itself(storage: Storage) -> None:
+    """Сам закончившийся цикл событий — потеря связи; остановка снаружи — нет."""
+    from max2tg.adapters.max_manager import MaxAccountManager
+
+    manager = MaxAccountManager(make_settings(), storage, _sink)
+    lost: list[int] = []
+
+    async def on_lost(account_id: int) -> None:
+        lost.append(account_id)
+
+    manager.set_lost_handler(on_lost)
+
+    for account_id, error in ((1, True), (2, False)):
+        session = _DyingSession(error)
+        manager._sessions[account_id] = session  # type: ignore[assignment]
+        await manager._run(account_id, session)  # type: ignore[arg-type]
+        assert account_id in lost
+        assert manager.session(account_id) is None
+        assert session.stopped is True
+
+    # Сессию убрали намеренно (/max_remove): сообщать не о чем.
+    lost.clear()
+    await manager._run(3, _DyingSession(False))  # type: ignore[arg-type]
+    assert lost == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_needs_a_saved_token(storage: Storage) -> None:
+    """Без сохранённого токена переподключение честно отсылает к /max_add."""
+    from max2tg.adapters.max_manager import MaxAccountManager
+
+    manager = MaxAccountManager(make_settings(), storage, _sink)
+    account = await storage.add_account(owner_id=OWNER, nickname="Без токена")
+
+    with pytest.raises(RuntimeError, match="/max_add"):
+        await manager.reconnect_account(account.id)
+
+
+class _FakeMapper:
+    """Соединение MAX, у которого можно проверить, что его действительно закрыли."""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self._lifecycle_manager = type("Manager", (), {})()
+        self._lifecycle_manager._manage_lifecycle_task = asyncio.ensure_future(asyncio.sleep(60))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_adapter_stop_ends_the_pyromax_reconnect_loop(storage: Storage) -> None:
+    """Остановка снимает задачу переподключения pyromax и закрывает соединение.
+
+    Иначе «удалённый» аккаунт продолжал пересылать сообщения: библиотека сама
+    поднимала сессию заново после отмены слушателя.
+    """
+    from max2tg.adapters.max_adapter import MaxAdapter
+
+    adapter = MaxAdapter(make_settings(), storage, _sink, account_id=1)
+    mapper = _FakeMapper()
+    adapter._api = type("Api", (), {"mapper": mapper})()  # type: ignore[assignment]
+    reconnect_loop = mapper._lifecycle_manager._manage_lifecycle_task
+
+    await adapter.stop()
+    await asyncio.sleep(0)
+
+    assert mapper.closed is True
+    assert reconnect_loop.cancelled() or reconnect_loop.cancelling() > 0
+
+
+@pytest.mark.asyncio
+async def test_adapter_stop_survives_a_broken_connection(storage: Storage) -> None:
+    """Сбой при закрытии соединения не должен ронять остановку."""
+    from max2tg.adapters.max_adapter import MaxAdapter
+
+    adapter = MaxAdapter(make_settings(), storage, _sink, account_id=1)
+
+    class _BrokenMapper:
+        async def close(self) -> None:
+            raise RuntimeError("сокет уже закрыт")
+
+    adapter._api = type("Api", (), {"mapper": _BrokenMapper()})()  # type: ignore[assignment]
+    await adapter.stop()  # не должно бросить
+
+
+class _StubbornSession:
+    """Сессия, слушатель которой проглатывает отмену — как это делает pyromax."""
+
+    def __init__(self) -> None:
+        self.stopped = False
+        #: Тест сам отпускает слушатель в конце — иначе он не даст закрыться циклу событий.
+        self.release = False
+
+    async def run(self) -> None:
+        while not self.release:
+            try:
+                await asyncio.sleep(0.05)
+            except asyncio.CancelledError:
+                continue
+
+    async def stop(self) -> None:
+        self.stopped = True
+
+
+@pytest.mark.asyncio
+async def test_stop_account_does_not_hang_on_a_stubborn_listener(storage: Storage) -> None:
+    """Команда /max_remove не зависает, даже если слушатель не реагирует на отмену."""
+    from max2tg.adapters.max_manager import MaxAccountManager
+
+    manager = MaxAccountManager(make_settings(), storage, _sink)
+    session = _StubbornSession()
+    manager._sessions[5] = session  # type: ignore[assignment]
+    manager._tasks[5] = asyncio.create_task(manager._run(5, session))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    await asyncio.wait_for(manager.stop_account(5), timeout=30.0)
+
+    session.release = True
+    assert session.stopped is True
+    assert manager.session(5) is None
+    # Ждали разумно долго, но не вечно.
+    assert loop.time() - started < 20

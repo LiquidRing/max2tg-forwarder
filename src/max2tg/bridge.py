@@ -72,7 +72,11 @@ class Bridge:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.exception("[%s] не удалось переслать сообщение", message.trace_id)
+                logger.exception(
+                    "[%s] не удалось переслать сообщение: %s",
+                    message.trace_id,
+                    describe_message(message),
+                )
                 await self._report_failure(message)
             finally:
                 queue.task_done()
@@ -200,3 +204,30 @@ class Bridge:
                 f"⚠️ Не удалось переслать сообщение (трассировка {message.trace_id}). "
                 "Подробности — в логах моста.",
             )
+
+
+def describe_message(message: NormalizedMessage) -> str:
+    """Короткое описание сообщения для журнала: откуда, куда и что в нём было.
+
+    Без этого запись «не удалось переслать» не отвечала на главный вопрос —
+    какое именно сообщение не дошло, — а по одной трассировке стека его не найти.
+    Содержимое текста намеренно не пишем: это чужая переписка, а длина и тип
+    вложений для разбора достаточны.
+    """
+    attachments = ", ".join(
+        f"{item.kind.value} {item.filename}"
+        + (f" ({item.size} Б)" if item.size is not None else "")
+        for item in message.attachments
+    )
+    parts = [
+        f"{message.source.value}#{message.source_message_id}",
+        f"чат {message.source_chat_id}",
+        f"аккаунт MAX {message.account_id}",
+        f"текст {len(message.text)} симв.",
+        f"вложения: {attachments}" if attachments else "без вложений",
+    ]
+    if message.reply_to_source_id:
+        parts.append("ответ на другое сообщение")
+    if message.is_edit:
+        parts.append("правка")
+    return ", ".join(parts)

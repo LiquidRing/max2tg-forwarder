@@ -230,3 +230,34 @@ async def test_repeated_push_is_not_delivered_twice(storage: Storage) -> None:
     await bridge.close()
 
     assert len(telegram.delivered) == 1
+
+
+def test_failure_log_names_the_message_that_did_not_arrive() -> None:
+    """В записи об ошибке видно, что именно пересылалось — но не сам текст."""
+    from max2tg.bridge import describe_message
+    from max2tg.models import AttachmentKind, NormalizedAttachment
+
+    async def loader() -> bytes:
+        return b""
+
+    message = NormalizedMessage(
+        source=Platform.TELEGRAM,
+        source_chat_id=-1001,
+        source_message_id="42",
+        account_id=3,
+        author="Кто-то",
+        text="секретный текст переписки",
+        reply_to_source_id="41",
+        attachments=[
+            NormalizedAttachment(
+                kind=AttachmentKind.VIDEO, filename="clip.mp4", loader=loader, size=2048
+            )
+        ],
+    )
+
+    line = describe_message(message)
+    assert "telegram#42" in line and "чат -1001" in line and "аккаунт MAX 3" in line
+    assert "video clip.mp4 (2048 Б)" in line
+    assert "ответ на другое сообщение" in line
+    # Чужую переписку в журнал не пишем: достаточно её длины.
+    assert "секретный" not in line and "25 симв." in line

@@ -143,6 +143,13 @@ DEGRADED_NOTES: dict[AttachmentKind, str] = {
     AttachmentKind.VOICE: "🎤 голосовое сообщение",
 }
 
+#: Расширения, которые MAX не принимает как вложение: загрузка проходит, а
+#: сообщение с таким файлом сервер «не готов» отправить никогда (pyromax ждёт
+#: и сдаётся с «Max attempts to send message exceeded»). Список составлен
+#: проверкой 19 расширений напрямую через API; остальные, включая .bat, .js,
+#: .msi, .zip, .dll, принимаются.
+BLOCKED_FILE_EXTENSIONS = frozenset({".html", ".htm", ".exe", ".sh", ".apk"})
+
 #: Длительность по умолчанию для кружка, если Telegram её не прислал.
 DEFAULT_ROUND_DURATION_MS = 1000
 
@@ -937,6 +944,14 @@ class MaxAdapter:
                 message.notes.append(hint)
 
             typeof = UPLOAD_TYPES.get(kind, FileAttachment)
+            if typeof is FileAttachment:
+                renamed = mask_blocked_extension(filename)
+                if renamed != filename:
+                    message.notes.append(
+                        f"📎 «{filename}» переименован в «{renamed}»: MAX не принимает такие "
+                        "файлы — уберите «.txt» из имени после скачивания"
+                    )
+                    filename = renamed
             try:
                 await self._limiter.acquire(chat_id)
                 result = await self.api.upload_file(data=payload, typeof=typeof, file_name=filename)
@@ -1267,3 +1282,10 @@ def _as_round(uploaded: Any, duration_seconds: int | None) -> Any:
         return uploaded
     duration_ms = int(duration_seconds * 1000) if duration_seconds else DEFAULT_ROUND_DURATION_MS
     return _RoundVideo(int(video_id), str(token), duration_ms)
+
+
+def mask_blocked_extension(filename: str) -> str:
+    """Добавить ``.txt`` к имени файла, который MAX иначе не примет."""
+    if Path(filename).suffix.lower() in BLOCKED_FILE_EXTENSIONS:
+        return f"{filename}.txt"
+    return filename

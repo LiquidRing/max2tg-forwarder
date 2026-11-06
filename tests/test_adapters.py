@@ -1494,3 +1494,20 @@ async def test_short_sync_stays_quiet(storage: Storage) -> None:
         assert not any(text.endswith("…") for text in sent)
     finally:
         await adapter.bot.session.close()
+
+
+def test_files_max_refuses_are_sent_with_a_txt_suffix() -> None:
+    """MAX не принимает .html, .exe и ещё несколько — они уходят под видом .txt.
+
+    Иначе сообщение зависало на две минуты и заканчивалось «не удалось переслать».
+    """
+    from max2tg.adapters.max_adapter import mask_blocked_extension
+
+    assert mask_blocked_extension("SEO Хабаровск.html") == "SEO Хабаровск.html.txt"
+    assert mask_blocked_extension("PAGE.HTM") == "PAGE.HTM.txt"
+    for blocked in ("setup.exe", "run.sh", "app.apk"):
+        assert mask_blocked_extension(blocked) == f"{blocked}.txt"
+
+    # Принимаемые расширения (проверены живьём) не трогаем.
+    for fine in ("notes.txt", "a.zip", "x.json", "run.bat", "main.js", "report.pdf", "html"):
+        assert mask_blocked_extension(fine) == fine

@@ -110,6 +110,9 @@ MEDIA_HISTORY_DEPTH = 5
 ANIMATED_STICKER_KEYS = ("lottieUrl", "animationUrl", "webmUrl", "videoUrl")
 STATIC_STICKER_KEYS = ("url", "baseUrl")
 
+#: Сколько последних сообщений чата просматривать, разыскивая только что пришедшую пересылку.
+FORWARD_REFETCH_DEPTH = 15
+
 #: Длина цитаты, которая показывается вместо недоступного оригинала.
 QUOTE_LIMIT = 120
 
@@ -404,6 +407,9 @@ class MaxAdapter:
             is_edit=is_edit,
         )
 
+        # Пересылку признаём по самой ссылке, а не по тому, каким обработчиком
+        # пришло событие: при переносе истории обработчика нет вовсе.
+        forwarded = forwarded or (link is not None and link.type == "FORWARD")
         if forwarded and link is not None:
             origin = await self._describe_forward(link)
             if origin:
@@ -413,7 +419,41 @@ class MaxAdapter:
             _restore_context(attach, message)
             await self._convert_attachment(message, attach, normalized)
 
+        # Содержимое пересланного лежит во вложенном сообщении: его вложения
+        # приходят не в ``message.attaches``. Без этого человек видел одну
+        # пометку «Переслано от …» и не мог понять, что именно переслали.
+        inner = link.message if forwarded and link is not None else None
+        if inner is not None:
+            attaches = list(getattr(inner, "attaches", None) or [])
+            if attaches:
+                # Вложения, пришедшие push-событием, обеднены (у голосового нет
+                # даже ссылки), а скачать по ним файл не удаётся. История чата
+                # отдаёт то же сообщение целиком — берём вложения оттуда.
+                attaches = await self._fresh_forward_attaches(message) or attaches
+            for attach in attaches:
+                # У вложенного сообщения чужой (а то и вовсе фиктивный, -1) чат:
+                # доступ к файлу есть только через пересылку в нашем чате.
+                _bind_to_message(attach, message)
+                await self._convert_attachment(message, attach, normalized)
+
         return normalized if not normalized.is_empty else None
+
+    async def _fresh_forward_attaches(self, message: Message) -> list[Any]:
+        """Перечитать пересланное сообщение из истории и вернуть его вложения."""
+        try:
+            await self._limiter.acquire(int(message.chat_id))
+            history = await self.api.get_chat_history(
+                chat_id=message.chat_id, backward=FORWARD_REFETCH_DEPTH
+            )
+        except Exception:
+            logger.debug("Не удалось перечитать пересылку %s", message.message_id, exc_info=True)
+            return []
+        for item in history:
+            if not isinstance(item, Message) or str(item.message_id) != str(message.message_id):
+                continue
+            inner = item.link.message if item.link is not None else None
+            return list(getattr(inner, "attaches", None) or [])
+        return []
 
     async def _quote(self, original: Any) -> str:
         """Короткая цитата сообщения, на которое отвечают."""
@@ -1289,3 +1329,14 @@ def mask_blocked_extension(filename: str) -> str:
     if Path(filename).suffix.lower() in BLOCKED_FILE_EXTENSIONS:
         return f"{filename}.txt"
     return filename
+
+
+def _bind_to_message(attach: Any, message: Message) -> None:
+    """Привязать вложение к сообщению, через которое его можно получить.
+
+    Для пересланного это внешнее сообщение: оригинал лежит в чужом чате, к
+    которому у аккаунта нет доступа, и запрос ссылки по нему не отвечает.
+    """
+    for field, value in (("chat_id", message.chat_id), ("message_id", message.message_id)):
+        with suppress(Exception):
+            setattr(attach, field, value)

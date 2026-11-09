@@ -1511,3 +1511,138 @@ def test_files_max_refuses_are_sent_with_a_txt_suffix() -> None:
     # Принимаемые расширения (проверены живьём) не трогаем.
     for fine in ("notes.txt", "a.zip", "x.json", "run.bat", "main.js", "report.pdf", "html"):
         assert mask_blocked_extension(fine) == fine
+
+
+@pytest.mark.asyncio
+async def test_forwarded_message_brings_its_text_and_attachments(storage: Storage) -> None:
+    """Пересылка из MAX не должна оставлять одну пометку «Переслано от…».
+
+    Содержимое лежит во вложенном сообщении: его текст и вложения копируются,
+    чтобы человек видел, что именно переслали.
+    """
+    from pyromax.models import Message as MaxMessage
+    from pyromax.models.Message import MessageLink
+
+    adapter = MaxAdapter(make_settings(), storage, await _collect([]))
+    adapter._names[7] = "Алекса"
+    adapter._names[9] = "Ирина Сергеевна"
+
+    document = FileMappingModel(type="FILE", file_id=42, token="t", name="статья.pdf", size=2048)
+    original = MaxMessage(
+        message_id=500,
+        chat_id=-1,
+        time=0,
+        type="USER",
+        text="текст исходного сообщения",
+        cid=None,
+        attaches=[document],
+        sender_id=9,
+    )
+    forward = MaxMessage(
+        message_id=501,
+        chat_id=MAX_CHAT,
+        time=0,
+        type="USER",
+        text="",
+        cid=None,
+        attaches=[],
+        sender_id=7,
+        link=MessageLink(type="FORWARD", message=original),
+    )
+
+    normalized = await adapter._normalize(forward, is_edit=False, forwarded=True)
+
+    assert normalized is not None
+    notes = "\n".join(normalized.notes)
+    assert "Переслано от Ирина Сергеевна" in notes
+    assert "текст исходного сообщения" in notes
+    assert [item.filename for item in normalized.attachments] == ["статья.pdf"]
+    assert normalized.attachments[0].kind is AttachmentKind.DOCUMENT
+    # Оригинал в чужом чате (у MAX это бывает -1) недоступен: вложение
+    # привязывается к пересылке в нашем чате, иначе файл не скачать.
+    assert (document.chat_id, str(document.message_id)) == (MAX_CHAT, "501")
+
+
+@pytest.mark.asyncio
+async def test_plain_message_does_not_pick_up_attachments_from_a_reply(storage: Storage) -> None:
+    """Вложения цитируемого сообщения при обычном ответе не копируются."""
+    from pyromax.models import Message as MaxMessage
+    from pyromax.models.Message import MessageLink
+
+    adapter = MaxAdapter(make_settings(), storage, await _collect([]))
+    document = FileMappingModel(type="FILE", file_id=42, token="t", name="чужой.pdf", size=1)
+    original = MaxMessage(
+        message_id=600,
+        chat_id=MAX_CHAT,
+        time=0,
+        type="USER",
+        text="исходное",
+        cid=None,
+        attaches=[document],
+        sender_id=7,
+    )
+    reply = MaxMessage(
+        message_id=601,
+        chat_id=MAX_CHAT,
+        time=0,
+        type="USER",
+        text="ответ",
+        cid=None,
+        attaches=[],
+        sender_id=7,
+        link=MessageLink(type="REPLY", message=original),
+    )
+
+    normalized = await adapter._normalize(reply, is_edit=False, forwarded=False)
+
+    assert normalized is not None
+    assert normalized.attachments == []
+
+
+@pytest.mark.asyncio
+async def test_forwarded_attachments_prefer_the_full_copy_from_history(storage: Storage) -> None:
+    """Вложение из push-события обеднено — берём то, что отдаёт история чата."""
+    from pyromax.models import Message as MaxMessage
+    from pyromax.models.Message import MessageLink
+
+    adapter = MaxAdapter(make_settings(), storage, await _collect([]))
+    poor = FileMappingModel(type="FILE", file_id=1, token="t", name="push.pdf")
+    full = FileMappingModel(type="FILE", file_id=1, token="t", name="history.pdf", size=10)
+    original = MaxMessage(
+        message_id=10,
+        chat_id=-1,
+        time=0,
+        type="USER",
+        text="",
+        cid=None,
+        attaches=[poor],
+        sender_id=7,
+    )
+    forward = MaxMessage(
+        message_id=11,
+        chat_id=MAX_CHAT,
+        time=0,
+        type="USER",
+        text="",
+        cid=None,
+        attaches=[],
+        sender_id=7,
+        link=MessageLink(type="FORWARD", message=original),
+    )
+
+    async def fresh(message: object) -> list[object]:
+        return [full]
+
+    adapter._fresh_forward_attaches = fresh  # type: ignore[method-assign]
+    normalized = await adapter._normalize(forward, is_edit=False, forwarded=False)
+    assert normalized is not None
+    assert [item.filename for item in normalized.attachments] == ["history.pdf"]
+
+    # История недоступна — остаются вложения из самого события, но не пропадают.
+    async def unavailable(message: object) -> list[object]:
+        return []
+
+    adapter._fresh_forward_attaches = unavailable  # type: ignore[method-assign]
+    fallback = await adapter._normalize(forward, is_edit=False, forwarded=False)
+    assert fallback is not None
+    assert [item.filename for item in fallback.attachments] == ["push.pdf"]
